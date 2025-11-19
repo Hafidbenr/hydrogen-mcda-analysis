@@ -15,22 +15,22 @@ Methodology
 The MCDA process involves:
 
 1\.  Data Preparation: Loading, winsorizing, and normalizing indicator data.  
-2\.  Weighting Scenarios: Defining and applying AHP weights for base, supply-led, and risk-aware scenarios (Tab. 2).  
+2\.  Weighting Scenarios: Defining and applying AHP weights for base, supply-led, and risk-aware scenarios 
 3\.  Score Calculation & Ranking: Calculating composite scores and ranking countries based on these scores.  
-4\.  Sensitivity Analysis: Assessing ranking uncertainty through bootstrap simulation (Output DataFrame) and evaluating the impact of individual weight perturbations (Fig. 4).
+4\.  Sensitivity Analysis: Assessing ranking uncertainty through bootstrap simulation (Output DataFrame) and evaluating the impact of individual weight perturbations 
 
 Outputs
 
 The notebook generates key outputs including:
 
 \-   Output DataFrame: Scores, ranks, and sensitivity measures.  
-\-   Tab. 1 & 2: Indicator metadata and AHP weights.  
+\-   Indicator metadata and AHP weights.  
 \-   Sub-scores: Normalized category scores.  
 \-   Figures:  
-\-   Fig. 2: Spider chart of sub-scores.  
-    \-   Fig. 1: Choropleth map of Supply Index and water stress overlay.  
-    \-   Fig. 3: Ranking with uncertainty bars.  
-    \-   Fig. 4: Heatmap of rank variation from weight perturbations.
+\-   Spider chart of sub-scores.  
+    \-  Choropleth map of Supply Index and water stress overlay.  
+    \-  Ranking with uncertainty bars.  
+    \-  Heatmap of rank variation from weight perturbations.
 
 Requirements
 
