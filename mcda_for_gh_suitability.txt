@@ -1,0 +1,517 @@
+﻿import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import geopandas as gpd
+import folium
+import plotly.graph_objects as go # Corrected import for Plotly
+from folium import Choropleth, LayerControl
+from scipy.stats import rankdata, spearmanr
+from math import pi
+# Removed: from scipy import scikit_learn (not a direct import, not used)
+import warnings
+from tqdm import tqdm  # progress bar for simulations
+import os # Added for path operations
+import zipfile # Added for zip file extraction
+
+
+# ---------- Configuration / reproducibility ----------
+np.random.seed(12345)  # set a seed for reproducibility
+warnings.filterwarnings('ignore')
+sns.set_style('whitegrid')
+
+
+# ---------- Helper functions (normalization, entropy weights, TOPSIS) ----------
+def normalize_matrix(data, criteria_dict):
+    """
+    Min-Max normalize DataFrame columns (0-1).
+    For 'benefit' higher is better; for 'cost' lower is better.
+    If a column is constant, assign 0.5 to avoid division by zero.
+    """
+    df = data.copy().astype(float)
+    for col in criteria_dict.keys():
+        if col not in df.columns:
+            raise KeyError(f"Criterion '{col}' not found in data columns.")
+        col_vals = df[col]
+        cmin = col_vals.min()
+        cmax = col_vals.max()
+        if np.isclose(cmax, cmin):
+            df[col] = 0.5
+            continue
+        if criteria_dict[col]['type'] == 'benefit':
+            df[col] = (col_vals - cmin) / (cmax - cmin)
+        else:  # cost
+            df[col] = (cmax - col_vals) / (cmax - cmin)
+    return df
+
+
+def calculate_entropy_weights(norm_data):
+    """
+    Shannon entropy weights.
+    norm_data: DataFrame, rows=alternatives, cols=criteria (values in [0,1])
+    Returns: numpy array of weights aligned with norm_data.columns
+    """
+    X = norm_data.copy().astype(float)
+    n = X.shape[0]
+    eps = 1e-12
+    col_sums = X.sum(axis=0) + eps  # avoid division by zero
+    P = X.div(col_sums, axis=1)  # probability matrix (col-wise)
+    k = 1.0 / np.log(n) if n > 1 else 1.0
+    H = -k * (P * np.log(P + eps)).sum(axis=0)  # entropy per column (Series)
+    D = 1 - H
+    # If D sums to zero (all zero information), fallback to uniform weights
+    if np.isclose(D.sum(), 0):
+        w = np.ones(len(D)) / len(D)
+    else:
+        w = (D / D.sum()).values
+    return w
+
+
+def run_topsis(norm_data, weights):
+    """
+    TOPSIS computation.
+    norm_data: DataFrame, rows=alternatives, cols=criteria
+    weights: array-like of length n_criteria in same column order
+    Returns: numpy array of TOPSIS scores (one per row, order follows norm_data.index)
+    """
+    W = np.asarray(weights).ravel()
+    if W.shape[0] != norm_data.shape[1]:
+        raise ValueError("Length of weights must match number of criteria (columns).")
+    Xw = norm_data.values * W  # weighted normalized matrix
+    pis = Xw.max(axis=0)  # positive ideal per criterion
+    nis = Xw.min(axis=0)  # negative ideal per criterion
+    d_pos = np.sqrt(np.sum((Xw - pis) ** 2, axis=1))
+    d_neg = np.sqrt(np.sum((Xw - nis) ** 2, axis=1))
+    denom = d_pos + d_neg
+    # avoid division by zero
+    denom[denom == 0] = 1e-12
+    score = d_neg / denom
+    return score
+
+
+def get_group_score(norm_df_local, codes_local, criteria_local, group_name, w_vector):
+    """
+    Compute weighted sub-score (group) for each alternative.
+    Returns numpy array (len = n_alternatives).
+    """
+    indices = [i for i, c in enumerate(codes_local) if criteria_local[c]['group'] == group_name]
+    cols = [c for c in codes_local if criteria_local[c]['group'] == group_name]
+    if len(cols) == 0:
+        return np.zeros(norm_df_local.shape[0])
+    sub_w = np.asarray(w_vector)[indices].astype(float)
+    # normalize sub-weights
+    if np.isclose(sub_w.sum(), 0):
+        sub_w = np.ones_like(sub_w) / len(sub_w)
+    else:
+        sub_w = sub_w / sub_w.sum()
+    sub_data = norm_df_local[cols].values  # (n_alternatives, n_group_criteria)
+    return sub_data.dot(sub_w)
+
+
+# ---------- Data loading ----------
+# NOTE: adapt the filename/path as needed. The script assumes 'hydrogen_mcda_dataset.csv' exists.
+df = pd.read_csv('hydrogen_mcda_dataset.csv')
+
+
+# WARNING: the original script truncated column names using split(' ')[0].
+# Keep that if your CSV has extra annotations in header names; otherwise comment out the next line.
+df.columns = [c.split(' ')[0] for c in df.columns]
+
+
+# You must have a 'Country' column
+if 'Country' not in df.columns:
+    raise KeyError("CSV must contain a 'Country' column.")
+
+
+countries = df['Country'].values
+
+
+# ---------- Define criteria structure ----------
+criteria = {
+    'S1': {'type': 'benefit', 'group': 'Supply'}, 'S2': {'type': 'benefit', 'group': 'Supply'},
+    'S3': {'type': 'cost', 'group': 'Supply'},    'S4': {'type': 'cost', 'group': 'Supply'},
+    'D1': {'type': 'benefit', 'group': 'Demand'}, 'D2': {'type': 'benefit', 'group': 'Demand'},
+    'D3': {'type': 'benefit', 'group': 'Demand'}, 'D4': {'type': 'benefit', 'group': 'Demand'},
+    'R1': {'type': 'benefit', 'group': 'Risk'},   'R2': {'type': 'benefit', 'group': 'Risk'},
+    'R3': {'type': 'benefit', 'group': 'Risk'}
+}
+codes = list(criteria.keys())
+
+
+# Basic check that all codes are in dataframe
+missing = [c for c in codes if c not in df.columns]
+if missing:
+    raise KeyError(f"The following criteria columns are missing from the CSV: {missing}")
+
+
+# ---------- Normalize data ----------
+norm_df = normalize_matrix(df.set_index('Country')[codes], criteria)
+
+
+# ---------- Weight calculations ----------
+# Entropy-based weights (objective)
+w_entropy = calculate_entropy_weights(norm_df)  # numpy array aligned with codes
+
+
+# AHP base weights (example vector from your original script)
+w_ahp_base = np.array([0.12, 0.10, 0.10, 0.13, 0.08, 0.08, 0.10, 0.09, 0.07, 0.07, 0.06])
+w_ahp_base = w_ahp_base / w_ahp_base.sum()
+
+
+# Combined base (average of AHP and Entropy)
+w_combined_base = (w_ahp_base + w_entropy) / 2.0
+w_combined_base = w_combined_base / w_combined_base.sum()
+
+
+# Scenario weights examples
+s_indices = [i for i, c in enumerate(codes) if criteria[c]['group'] == 'Supply']
+w_supply = w_combined_base.copy(); w_supply[s_indices] *= 1.5; w_supply = w_supply / w_supply.sum()
+r_indices = [i for i, c in enumerate(codes) if criteria[c]['group'] == 'Risk']
+w_risk = w_combined_base.copy(); w_risk[r_indices] *= 1.5; w_risk = w_risk / w_risk.sum()
+
+
+# ---------- Table 1: Weights summary ----------
+table1 = pd.DataFrame({
+    'Indicator': codes,
+    'AHP (Base)': w_ahp_base,
+    'Entropy': w_entropy,
+    'Combined Base': w_combined_base,
+    'Combined Supply-led': w_supply,
+    'Combined Risk-Aware': w_risk
+})
+# Round numerical columns in table1 BEFORE adding the 'CR' row
+for col in table1.columns:
+    if pd.api.types.is_numeric_dtype(table1[col]):
+        table1[col] = table1[col].round(3)
+table1.loc['CR'] = ['CR', '<0.1', '-', '<0.1', '<0.1', '<0.1'] # Added 'CR' to match column count
+table1.to_csv('Table_1_AHP_Weights.csv', index=False, float_format='%.3f')
+
+
+# Table 2: Bootstrap intervals for mean weights (Dirichlet-based for combined weights) ----------
+# Define n_boot here for consistency and to enable running this block independently
+n_boot = 5000 # User specified 5000 runs
+concentration_param_K = 100 # A parameter to control the spread of Dirichlet distribution
+
+
+boot_weights_dirichlet = []
+dirichlet_alpha = w_combined_base * concentration_param_K
+
+
+for _ in range(n_boot):
+    # Simulate weights from a Dirichlet distribution
+    new_w = np.random.dirichlet(dirichlet_alpha)
+    boot_weights_dirichlet.append(new_w)
+
+
+boot_weights_dirichlet = np.array(boot_weights_dirichlet)
+
+
+# Calculate percentiles from the simulated Dirichlet weights
+lower_w_dirichlet = np.percentile(boot_weights_dirichlet, 2.5, axis=0)
+upper_w_dirichlet = np.percentile(boot_weights_dirichlet, 97.5, axis=0)
+
+
+# The mean weight for Table 2 and Figure 1 should be the combined base as per user request
+table2 = pd.DataFrame({
+    'Indicator': codes,
+    'Mean Weight': w_combined_base, # Use w_combined_base as requested by the user
+    '2.5th Percentile': lower_w_dirichlet,
+    '97.5th Percentile': upper_w_dirichlet
+})
+# Round all numerical columns in table2
+for col in table2.columns:
+    if pd.api.types.is_numeric_dtype(table2[col]):
+        table2[col] = table2[col].round(3)
+table2.to_csv('Table_2_Weight_Intervals.csv', index=False, float_format='%.3f')
+
+
+# Figure 1 (Dirichlet-based weight intervals)
+plt.figure(figsize=(10, 6))
+# Use w_combined_base as the central point for the error bars
+plt.errorbar(codes, w_combined_base, yerr=[w_combined_base - lower_w_dirichlet, upper_w_dirichlet - w_combined_base], fmt='o', capsize=5)
+plt.title('Figure 1: Dirichlet-Based Weight Intervals (95% Confidence)')
+plt.ylabel('Weight Value')
+plt.xticks(rotation=45, ha='right')
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.tight_layout()
+plt.savefig('Fig_1_Dirichlet_Weights.png') # Changed filename to reflect method
+plt.close()
+
+
+# ---------- Sensitivity analysis (Dirichlet-based perturbation of weights) ----------
+n_sim = 5000
+num_countries = len(df)
+sim_ranks = np.zeros((n_sim, num_countries))
+sim_scores = np.zeros((n_sim, num_countries))
+
+
+# Progress bar for long simulation loop
+for i in tqdm(range(n_sim), desc="Running sensitivity sims"):
+    perturbation = np.random.uniform(0.8, 1.2, size=len(w_combined_base))
+    w_sim = w_combined_base * perturbation
+    w_sim = w_sim / w_sim.sum()
+    s = run_topsis(norm_df, w_sim)
+    r = rankdata(-s, method='min')
+    sim_scores[i, :] = s
+    sim_ranks[i, :] = r
+
+
+# ---------- Compute mean Spearman's rho across all unique country pairs efficiently ----------
+# Each country's rank-vector is sim_ranks[:, country_index] (length n_sim).
+# Spearman between two countries = Pearson correlation of these rank-vectors (since vectors are ranks).
+# Use np.corrcoef on the transposed sim_ranks (shape: num_countries x n_sim) to get pairwise correlations quickly.
+# Note: corrcoef expects variables as rows; provide sim_ranks.T to get variables=columns -> transpose accordingly.
+# We'll compute correlation matrix of shape (num_countries, num_countries).
+with np.errstate(invalid='ignore'):
+    corr_matrix = np.corrcoef(sim_ranks.T)  # correlation of rank-vectors
+# corr_matrix may contain NaN if some country had zero variance across sims; handle that:
+# Replace NaN with 0 (interpreting no variability as zero correlation).
+corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+
+
+# Extract upper triangle (i<j) and compute mean
+triu_indices = np.triu_indices(num_countries, k=1)
+pairwise_rhos = corr_matrix[triu_indices]
+if pairwise_rhos.size == 0:
+    mean_rho = np.nan
+else:
+    mean_rho = pairwise_rhos.mean()
+
+
+print(f"Mean Spearman's Rank Correlation Coefficient (ρ) across all country pairs: {mean_rho:.4f}")
+
+
+# ---------- Main TOPSIS run, ranks, and uncertainty statistics ----------
+main_scores = run_topsis(norm_df, w_combined_base)
+main_ranks = rankdata(-main_scores, method='min')
+score_std = np.std(sim_scores, axis=0)
+rank_std = np.std(sim_ranks, axis=0)
+rank_min = np.min(sim_ranks, axis=0)
+rank_max = np.max(sim_ranks, axis=0)
+
+
+table3 = pd.DataFrame({
+    'Country': countries,
+    'Score': main_scores,
+    'Score_Std': score_std,
+    'Rank': main_ranks,
+    'Rank_Min': rank_min,
+    'Rank_Max': rank_max
+})
+table3 = table3.sort_values('Rank', ascending=True).reset_index(drop=True)
+# Round all numerical columns in table3
+for col in table3.columns:
+    if pd.api.types.is_numeric_dtype(table3[col]):
+        table3[col] = table3[col].round(3)
+table3.to_csv('Table_3_Ranking_Updated.csv', index=False, float_format='%.3f')
+
+
+# ---------- Figure 5: Heatmap (rank frequency) - ensure same ordering as table3 ----------
+order = list(table3['Country'])
+orig_to_index = {c: i for i, c in enumerate(countries)}
+ordered_indices = [orig_to_index[c] for c in order]
+
+
+rank_freq = np.zeros((num_countries, num_countries))
+for new_row_idx, orig_idx in enumerate(ordered_indices):
+    # count how many times this country got rank r in the simulations
+    for r in range(1, num_countries + 1):
+        rank_freq[new_row_idx, r - 1] = np.sum(sim_ranks[:, orig_idx] == r)
+rank_freq_pct = rank_freq / n_sim
+
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(rank_freq_pct, annot=True, fmt=".1%", cmap="YlGnBu",
+            xticklabels=range(1, num_countries + 1), yticklabels=order)
+plt.title("Figure 5: Global Sensitivity Heatmap (Rank Stability)")
+plt.xlabel("Rank")
+plt.ylabel("Country")
+plt.tight_layout()
+plt.savefig('Fig_5_Sensitivity_Heatmap_Updated.png')
+plt.close()
+
+
+# Figure 2: Ranking with uncertainty bars
+plt.figure(figsize=(10, 6))
+plt.barh(table3['Country'], table3['Rank'], xerr=[table3['Rank'] - table3['Rank_Min'], table3['Rank_Max'] - table3['Rank']], capsize=5)
+plt.gca().invert_yaxis() # Invert y-axis to have rank 1 at the top
+plt.title('Figure 2: Ranking with Uncertainty Bars (Rank Variation)')
+plt.xlabel('Rank')
+plt.ylabel('Country')
+plt.grid(axis='x', linestyle='--', alpha=0.6)
+plt.tight_layout()
+plt.savefig('Fig_2_Ranking_Uncertainty.png')
+plt.close()
+
+
+# ---------- Table 4: Sub-scores (Supply, Demand, Risk) ----------
+table4 = pd.DataFrame({'Country': countries})
+table4['Supply Score'] = get_group_score(norm_df, codes, criteria, 'Supply', w_combined_base)
+table4['Demand Score'] = get_group_score(norm_df, codes, criteria, 'Demand', w_combined_base)
+table4['Risk Score'] = get_group_score(norm_df, codes, criteria, 'Risk', w_combined_base)
+# Round all numerical columns in table4
+for col in table4.columns:
+    if pd.api.types.is_numeric_dtype(table4[col]):
+        table4[col] = table4[col].round(3)
+table4.to_csv('Table_4_Sub_Scores.csv', index=False, float_format='%.3f')
+
+
+# ---------- Figure 3: Spider chart (radar) for all countries ----------
+spider_data = table4.set_index('Country')
+categories = list(spider_data.columns)
+N = len(categories)
+angles = [n / float(N) * 2 * pi for n in range(N)]
+angles += angles[:1]
+
+
+plt.figure(figsize=(10, 10))
+ax = plt.subplot(111, polar=True)
+ax.set_theta_offset(pi / 2)
+ax.set_theta_direction(-1)
+plt.xticks(angles[:-1], categories, color='grey', size=12)
+ax.set_rlabel_position(0)
+ticks = np.arange(0.2, 1.0, 0.2)
+plt.yticks(ticks, [f"{x:.1f}" for x in ticks], color="grey", size=8)
+plt.ylim(0, 1)
+
+
+# Choose a color palette that scales with number of countries
+n_countries = len(spider_data.index)
+# use tab20 if many countries, else tab10
+if n_countries <= 10:
+    colors = sns.color_palette('tab10', n_countries)
+else:
+    colors = sns.color_palette('tab20', n_countries) if n_countries <= 20 else plt.cm.get_cmap('tab20', n_countries).colors
+
+
+for i, country in enumerate(spider_data.index):
+    values = spider_data.loc[country].values.flatten().tolist()
+    values += values[:1]
+    ax.plot(angles, values, linewidth=1.5, linestyle='solid', label=country, color=colors[i])
+    ax.fill(angles, values, color=colors[i], alpha=0.08)
+
+
+plt.title('Figure 3: Spider chart of Sub-scores (All Countries)', size=14, y=1.08)
+plt.legend(loc='upper right', bbox_to_anchor=(1.25, 1.0))
+plt.tight_layout()
+plt.savefig('Fig_3_Spider_Chart.png')
+plt.close()
+
+
+# ================================================================
+# Figure 4 CHOROPLETH MAP
+# ================================================================
+
+
+# Prepare data for map
+map_data = {
+    'country': countries,
+    'S_Index': table4['Supply Score'].values,  # Supply sub-scores as S-Index
+    'Aqueduct_Stress': df['S4'].values  # Changed from norm_df['S4'] to df['S4'] to use original 0-5 scale
+}
+map_df = pd.DataFrame(map_data)
+
+
+# Use the uploaded shapefile directly
+shell_path = "ne_10m_admin_0_countries.zip" # Using the filename provided by the user
+extracted_path = "ne_10m_admin_0_countries" # Directory name based on zip file name
+world_shapefile = os.path.join(extracted_path, "ne_10m_admin_0_countries.shp") # Shapefile name within the zip
+
+
+# Extract the zip file
+try:
+    if not os.path.exists(extracted_path):
+        with zipfile.ZipFile(shell_path, 'r') as zip_ref:
+            zip_ref.extractall(extracted_path)
+        print("Shapefile extracted from uploaded zip.")
+    else:
+        print("Shapefile already extracted.")
+except FileNotFoundError:
+    print(f"Error: The uploaded zip file '{shell_path}' was not found.")
+    print("Please make sure you have uploaded the file with this exact name.")
+    m = None # Set map object to None to indicate failure
+except zipfile.BadZipFile:
+    print(f"Error: The uploaded file '{shell_path}' is not a valid zip file.")
+    print("Please check the uploaded file to ensure it's not corrupted.")
+    m = None # Set map object to None to indicate failure
+
+
+
+
+if os.path.exists(world_shapefile):
+    world = gpd.read_file(world_shapefile)
+
+
+    # Assuming the country name column is 'ADMIN' based on common Natural Earth shapefiles
+    country_column = 'ADMIN'
+
+
+    # Filter to MENA
+    mena_gdf = world[world[country_column].isin(map_data['country'])]
+
+
+    # Merge data with GeoDataFrame
+    mena_gdf = mena_gdf.merge(map_df, left_on=country_column, right_on='country', how='left')
+
+
+    # Create interactive choropleth map
+    m = folium.Map(location=[25, 45], zoom_start=4, tiles='CartoDB positron')
+
+
+    # Layer 1: Choropleth for S-Index
+    Choropleth(
+        geo_data=mena_gdf.to_json(),
+        data=mena_gdf,
+        columns=['country', 'S_Index'],
+        key_on=f'feature.properties.{country_column}', # Use the correct column for key_on
+        fill_color='YlGn',  # Green scale for higher S-Index
+        fill_opacity=0.7,
+        line_opacity=0.2,
+        legend_name='S-Index (Supply) [Updated]',
+        name='S-Index Layer [Updated]', # Name for LayerControl
+        bins=np.arange(0, 1.01, 0.1) # Set bins from 0 to 1 with 0.1 intervals
+    ).add_to(m)
+
+
+    # Layer 2: Overlay for Aqueduct
+    # Add directly to map and give it a name for LayerControl
+    Choropleth(
+        geo_data=mena_gdf.to_json(),
+        data=mena_gdf,
+        columns=['country', 'Aqueduct_Stress'], # Correct column name
+        key_on=f'feature.properties.{country_column}', # Correct key_on
+        fill_color='OrRd',  # Red scale for higher stress
+        fill_opacity=0.7,
+        line_opacity=0.2,
+        nan_fill_color="lightgrey",
+        legend_name="WRI Aqueduct Risk (S4)",
+        name='Aqueduct Overlay',
+        bins=list(np.arange(0, 6))
+    ).add_to(m)
+
+
+    # Add layer control - it will automatically pick up named layers
+    LayerControl().add_to(m)
+
+
+    # Display map
+    print("Fig. 1 – Choropleth map S-Index (supply) and WRI Aqueduct in overlay :")
+    display(m) # Use display for Folium maps
+
+
+    # Save the map to an HTML file
+    m.save('Fig_4_Choropleth_Map.html')
+    print("Choropleth map saved to Fig_4_Choropleth_Map.html")
+
+
+else:
+    print("Error: Shapefile not found after extraction. Skipping map plotting.")
+    m = None
+
+
+
+
+# ---------- Final message ----------
+print("All done. CSV outputs and figures saved to working directory:")
+print("- Table_1_AHP_Weights.csv, Table_2_Weight_Intervals.csv, Table_3_Ranking_Updated.csv, Table_4_Sub_Scores.csv")
+print("- Fig_1_Dirichlet_Weights.png, Fig_2_Ranking_Uncertainty_Rank_Variation.png, Fig_3_Spider_Chart.png, Fig_5_Sensitivity_Heatmap_Updated.png")
